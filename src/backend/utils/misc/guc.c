@@ -880,17 +880,8 @@ static const unit_conversion time_unit_conversion_table[] =
 
 static struct config_bool ConfigureNamesBool[] =
 {
-		{
-		
-		{"set_current_query", PGC_USERSET, QUERY_TUNING_COST,
-			gettext_noop("set the planner to the current query."),
-			NULL,
-			GUC_EXPLAIN
-		},
-		&set_current_query,
-		-1,0,1000,
-		NULL, NULL, NULL
-	},
+
+
 	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),
@@ -2793,6 +2784,17 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&backend_flush_after,
 		DEFAULT_BACKEND_FLUSH_AFTER, 0, WRITEBACK_MAX_PENDING_FLUSHES,
+		NULL, NULL, NULL
+	},
+
+		{
+		{"set_current_query", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("set the planner to the current query."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&set_current_query,
+		-1, -1, 1000,
 		NULL, NULL, NULL
 	},
 

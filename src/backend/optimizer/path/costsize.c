@@ -139,6 +139,9 @@ bool		enable_parallel_append = true;
 bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
 
+// our new variable
+int		 	set_current_query = true;
+
 typedef struct
 {
 	PlannerInfo *root;
@@ -166,6 +169,10 @@ static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 double inner_rows,
 										 SpecialJoinInfo *sjinfo,
 										 List *restrictlist);
+//our new added routine
+static double calc_baserel_size_estimate(PlannerInfo *root,
+										 RelOptInfo *rel,
+										 List *allclauses);
 static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 													Relids outer_relids,
 													Relids inner_relids,
@@ -4389,6 +4396,105 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 }
 
 
+
+//Our new routine calc_baserel_size_estimate
+static double
+calc_baserel_size_estimate(PlannerInfo *root, RelOptInfo *rel,List *allclauses)
+
+{
+	RangeTblEntry *rte;
+	FILE *fp;
+	FILE *fp2;
+	int ret;
+	char *pos;
+	char *p;
+	char key[1000];
+	char cmp[1000];
+    int num_tables = 0;
+	size_t len_t;
+	double nrows;
+
+	// Keep postgres estimates
+	if (allclauses == NULL) {
+		nrows = rel->tuples * clauselist_selectivity(root,
+							   rel->baserestrictinfo,
+							   0,
+							   JOIN_INNER,
+							   NULL);
+	} else 
+	{
+		nrows = rel->tuples * clauselist_selectivity(root,
+							   allclauses,
+							   rel->relid,	/* do not use 0! */
+							   JOIN_INNER,
+							   NULL);
+	}
+
+	
+	 // our new code
+	 /* get the number of base relations in the query */
+	int x = -1;
+	while ((x = bms_next_member(rel->relids, x)) >= 0)
+	{
+		rte = root->simple_rte_array[x];
+		if (rte->rtekind == RTE_RELATION)
+		{
+            num_tables++;
+		}
+	}
+
+    x = -1;
+    char *tableAliases[20];
+    int index = 0;
+    while ((x = bms_next_member(rel->relids, x)) >= 0)
+    {
+        rte = root->simple_rte_array[x];
+        if (rte->rtekind == RTE_RELATION)
+        {
+            tableAliases[index] = rte->eref->aliasname;
+            index++;
+        }
+    }
+
+    // Build the key
+    sprintf(key, "%d", set_current_query);
+    strcat(key, ",");
+    for(int i=0; i<num_tables; i++){
+        strcat(strcat(key, tableAliases[i]), ",");
+    }
+
+
+    fp2 = fopen("log2.txt","a+");
+    fp = fopen("info.txt","a+");
+
+    // probe the text file with your key 
+	len_t = strlen(key);
+	
+	while (fgets(cmp, 1000, fp) != NULL){
+		if ((pos=strchr(cmp, '\n')) != NULL){
+			*pos = '\0';
+		}
+		p = strtok(cmp, ":");
+		ret = strcmp(key, p);
+		if(ret == 0){
+			p = strtok(NULL, ":");
+            double customVal = atof(p);
+
+            fprintf(fp2, "%s|%f|%f\n", key, customVal, clamp_row_est(nrows));
+
+            fclose(fp);
+            fclose(fp2);
+            return clamp_row_est(customVal);
+		}
+	}
+    fprintf(fp2, "%s|NO MATCH\n", key);
+    fclose(fp);
+    fclose(fp2);
+    return clamp_row_est(nrows);
+
+}
+
+
 /*
  * set_baserel_size_estimates
  *		Set the size estimates for the given base relation.
@@ -4405,23 +4511,19 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 void
 set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 {
-	double		nrows;
 
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   rel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
-
-	rel->rows = clamp_row_est(nrows);
+	rel->rows=calc_baserel_size_estimate(root,rel,NULL);
+										   
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);
+
+	
+
 }
 
 /*
@@ -4447,13 +4549,9 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	allclauses = list_concat(list_copy(param_clauses),
 							 rel->baserestrictinfo);
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   allclauses,
-							   rel->relid,	/* do not use 0! */
-							   JOIN_INNER,
-							   NULL);
-	nrows = clamp_row_est(nrows);
+
+	nrows=calc_baserel_size_estimate(root,rel,allclauses);
+
 	/* For safety, make sure result is not more than the base estimate */
 	if (nrows > rel->rows)
 		nrows = rel->rows;
@@ -4545,6 +4643,20 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
 		nrows = rel->rows;
 	return nrows;
 }
+
+
+/*
+ * String comparison function
+ */
+int
+StringCompare( const void* a, const void* b)
+{
+    char const **char_a = a;
+    char const **char_b = b;
+
+    return strcmp(*char_a, *char_b);
+}
+
 
 /*
  * calc_joinrel_size_estimate
@@ -4688,6 +4800,115 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 			nrows = 0;			/* keep compiler quiet */
 			break;
 	}
+
+
+	// BEGIN MODIFIED CODE
+	int ret;
+	char *pos;
+	char *p;
+	char key[1000];
+	char cmp[1000];
+	RangeTblEntry *rte;
+	FILE *fp;
+	FILE *fp2;
+	size_t len_t;
+    int num_tables = 0;
+
+    /* get the number of base relations in the query */
+	int x = -1;
+	while ((x = bms_next_member(inner_rel->relids, x)) >= 0)
+	{
+		rte = root->simple_rte_array[x];
+		if (rte->rtekind == RTE_RELATION)
+		{
+            num_tables++;
+		}
+	}
+
+	x = -1;
+	while ((x = bms_next_member(outer_rel->relids, x)) >= 0)
+	{
+		rte = root->simple_rte_array[x];
+		if (rte->rtekind == RTE_RELATION)
+		{
+            num_tables++;
+		}
+	}
+
+    /* gather and sort the relation aliases */
+    x = -1;
+   	char *tableAliases[20];
+    //char** tableAliases= malloc((num_tables)* sizeof(char*));
+
+    
+    int index = 0;
+    while ((x = bms_next_member(inner_rel->relids, x)) >= 0)
+    {
+        rte = root->simple_rte_array[x];
+        if (rte->rtekind == RTE_RELATION)
+        {
+        	//tableAliases[index] = malloc(strlen(rte->eref->aliasname)* sizeof(char));
+            tableAliases[index] = rte->eref->aliasname;
+            index++;
+        }
+    }
+
+    x = -1;
+    while ((x = bms_next_member(outer_rel->relids, x)) >= 0)
+    {
+        rte = root->simple_rte_array[x];
+        if (rte->rtekind == RTE_RELATION)
+        {
+        	//tableAliases[index] = malloc(strlen(rte->eref->aliasname)* sizeof(char));
+            tableAliases[index] = rte->eref->aliasname;
+            index++;
+        }
+    }
+
+    qsort(tableAliases, num_tables, sizeof(char*), StringCompare);
+
+    /* build the key with the relation aliases */
+
+    sprintf(key, "%d", set_current_query);
+    strcat(key, ",");
+    for(int i=0; i<num_tables; i++){
+        strcat(strcat(key, tableAliases[i]), ",");
+    }
+
+    //for (int i = 0; i < num_tables; i++) {
+    //	free(tableAliases[i]);
+	//}
+	//free(tableAliases[0]);
+    //free(tableAliases);
+
+    fp2 = fopen("log.txt","a+");
+    fp = fopen("info.txt","a+");
+
+    // probe the text file with your key 
+    	
+	len_t = strlen(key);
+	
+	while (fgets(cmp, 1000, fp) != NULL){
+		if ((pos=strchr(cmp, '\n')) != NULL){
+			*pos = '\0';
+		}
+		p = strtok(cmp, ":");
+		ret = strcmp(key, p);
+		if(ret == 0){
+			p = strtok(NULL, ":");
+            double customVal = atof(p);
+
+            fprintf(fp2, "%s|%f|%f\n", key, customVal, clamp_row_est(nrows));
+
+            fclose(fp);
+            fclose(fp2);
+            return clamp_row_est(customVal);
+		}
+	}
+    fprintf(fp2, "%s|NO MATCH\n", key);
+    fclose(fp);
+    fclose(fp2);
+
 
 	return clamp_row_est(nrows);
 }

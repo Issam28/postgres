@@ -882,7 +882,7 @@ static struct config_bool ConfigureNamesBool[] =
 {
 		{
 		
-		{"set_current_query", PGC_USERSET, QUERY_TUNING_METHOD,
+		{"set_current_query", PGC_USERSET, QUERY_TUNING_COST,
 			gettext_noop("set the planner to the current query."),
 			NULL,
 			GUC_EXPLAIN

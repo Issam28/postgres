@@ -140,7 +140,7 @@ bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
 
 // our new variable
-int		 	set_current_query = true;
+int		 	set_current_query = -1;
 
 typedef struct
 {

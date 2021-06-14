@@ -96,7 +96,7 @@ typedef struct SlotErrCallbackArg
 static MemoryContext ApplyMessageContext = NULL;
 MemoryContext ApplyContext = NULL;
 
-WalReceiverConn *wrconn = NULL;
+WalReceiverConn *LogRepWorkerWalRcvConn = NULL;
 
 Subscription *MySubscription = NULL;
 bool		MySubscriptionValid = false;
@@ -138,30 +138,41 @@ should_apply_changes_for_rel(LogicalRepRelMapEntry *rel)
 }
 
 /*
- * Make sure that we started local transaction.
+ * Begin one step (one INSERT, UPDATE, etc) of a replication transaction.
  *
- * Also switches to ApplyMessageContext as necessary.
+ * Start a transaction, if this is the first step (else we keep using the
+ * existing transaction).
+ * Also provide a global snapshot and ensure we run in ApplyMessageContext.
  */
-static bool
-ensure_transaction(void)
+static void
+begin_replication_step(void)
 {
-	if (IsTransactionState())
+	SetCurrentStatementStartTimestamp();
+
+	if (!IsTransactionState())
 	{
-		SetCurrentStatementStartTimestamp();
-
-		if (CurrentMemoryContext != ApplyMessageContext)
-			MemoryContextSwitchTo(ApplyMessageContext);
-
-		return false;
+		StartTransactionCommand();
+		maybe_reread_subscription();
 	}
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-
-	maybe_reread_subscription();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
 	MemoryContextSwitchTo(ApplyMessageContext);
-	return true;
+}
+
+/*
+ * Finish up one step of a replication transaction.
+ * Callers of begin_replication_step() must also call this.
+ *
+ * We don't close out the transaction here, but we should increment
+ * the command counter to make the effects of this step visible.
+ */
+static void
+end_replication_step(void)
+{
+	PopActiveSnapshot();
+
+	CommandCounterIncrement();
 }
 
 
@@ -200,6 +211,21 @@ create_estate_for_relation(LogicalRepRelMapEntry *rel)
 	AfterTriggerBeginQuery();
 
 	return estate;
+}
+
+/*
+ * Finish any operations related to the executor state created by
+ * create_estate_for_relation().
+ */
+static void
+finish_estate(EState *estate)
+{
+	/* Handle any queued AFTER triggers. */
+	AfterTriggerEndQuery(estate);
+
+	/* Cleanup. */
+	ExecResetTupleTable(estate->es_tupleTable, false);
+	FreeExecutorState(estate);
 }
 
 /*
@@ -475,7 +501,14 @@ apply_handle_commit(StringInfo s)
 
 	logicalrep_read_commit(s, &commit_data);
 
-	Assert(commit_data.commit_lsn == remote_final_lsn);
+	if (commit_data.commit_lsn != remote_final_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg_internal("incorrect commit LSN %X/%X in commit message (expected %X/%X)",
+								 (uint32) (commit_data.commit_lsn >> 32),
+								 (uint32) commit_data.commit_lsn,
+								 (uint32) (remote_final_lsn >> 32),
+								 (uint32) remote_final_lsn)));
 
 	/* The synchronization worker runs in single transaction. */
 	if (IsTransactionState() && !am_tablesync_worker())
@@ -589,7 +622,7 @@ apply_handle_insert(StringInfo s)
 	TupleTableSlot *remoteslot;
 	MemoryContext oldctx;
 
-	ensure_transaction();
+	begin_replication_step();
 
 	relid = logicalrep_read_insert(s, &newtup);
 	rel = logicalrep_rel_open(relid, RowExclusiveLock);
@@ -600,6 +633,7 @@ apply_handle_insert(StringInfo s)
 		 * transaction so it's safe to unlock it.
 		 */
 		logicalrep_rel_close(rel, RowExclusiveLock);
+		end_replication_step();
 		return;
 	}
 
@@ -608,9 +642,6 @@ apply_handle_insert(StringInfo s)
 	remoteslot = ExecInitExtraTupleSlot(estate,
 										RelationGetDescr(rel->localrel),
 										&TTSOpsVirtual);
-
-	/* Input functions may need an active snapshot, so get one */
-	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/* Process and store remote tuple in the slot */
 	oldctx = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
@@ -625,17 +656,12 @@ apply_handle_insert(StringInfo s)
 
 	/* Cleanup. */
 	ExecCloseIndices(estate->es_result_relation_info);
-	PopActiveSnapshot();
 
-	/* Handle queued AFTER triggers. */
-	AfterTriggerEndQuery(estate);
-
-	ExecResetTupleTable(estate->es_tupleTable, false);
-	FreeExecutorState(estate);
+	finish_estate(estate);
 
 	logicalrep_rel_close(rel, NoLock);
 
-	CommandCounterIncrement();
+	end_replication_step();
 }
 
 /*
@@ -693,7 +719,7 @@ apply_handle_update(StringInfo s)
 	bool		found;
 	MemoryContext oldctx;
 
-	ensure_transaction();
+	begin_replication_step();
 
 	relid = logicalrep_read_update(s, &has_oldtup, &oldtup,
 								   &newtup);
@@ -705,6 +731,7 @@ apply_handle_update(StringInfo s)
 		 * transaction so it's safe to unlock it.
 		 */
 		logicalrep_rel_close(rel, RowExclusiveLock);
+		end_replication_step();
 		return;
 	}
 
@@ -745,7 +772,6 @@ apply_handle_update(StringInfo s)
 	/* Also populate extraUpdatedCols, in case we have generated columns */
 	fill_extraUpdatedCols(target_rte, rel->localrel);
 
-	PushActiveSnapshot(GetTransactionSnapshot());
 	ExecOpenIndices(estate->es_result_relation_info, false);
 
 	/* Build the search tuple. */
@@ -804,19 +830,14 @@ apply_handle_update(StringInfo s)
 	}
 
 	/* Cleanup. */
-	ExecCloseIndices(estate->es_result_relation_info);
-	PopActiveSnapshot();
-
-	/* Handle queued AFTER triggers. */
-	AfterTriggerEndQuery(estate);
-
 	EvalPlanQualEnd(&epqstate);
-	ExecResetTupleTable(estate->es_tupleTable, false);
-	FreeExecutorState(estate);
+	ExecCloseIndices(estate->es_result_relation_info);
+
+	finish_estate(estate);
 
 	logicalrep_rel_close(rel, NoLock);
 
-	CommandCounterIncrement();
+	end_replication_step();
 }
 
 /*
@@ -838,7 +859,7 @@ apply_handle_delete(StringInfo s)
 	bool		found;
 	MemoryContext oldctx;
 
-	ensure_transaction();
+	begin_replication_step();
 
 	relid = logicalrep_read_delete(s, &oldtup);
 	rel = logicalrep_rel_open(relid, RowExclusiveLock);
@@ -849,6 +870,7 @@ apply_handle_delete(StringInfo s)
 		 * transaction so it's safe to unlock it.
 		 */
 		logicalrep_rel_close(rel, RowExclusiveLock);
+		end_replication_step();
 		return;
 	}
 
@@ -864,7 +886,6 @@ apply_handle_delete(StringInfo s)
 								  &estate->es_tupleTable);
 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
 
-	PushActiveSnapshot(GetTransactionSnapshot());
 	ExecOpenIndices(estate->es_result_relation_info, false);
 
 	/* Find the tuple using the replica identity index. */
@@ -905,19 +926,14 @@ apply_handle_delete(StringInfo s)
 	}
 
 	/* Cleanup. */
-	ExecCloseIndices(estate->es_result_relation_info);
-	PopActiveSnapshot();
-
-	/* Handle queued AFTER triggers. */
-	AfterTriggerEndQuery(estate);
-
 	EvalPlanQualEnd(&epqstate);
-	ExecResetTupleTable(estate->es_tupleTable, false);
-	FreeExecutorState(estate);
+	ExecCloseIndices(estate->es_result_relation_info);
+
+	finish_estate(estate);
 
 	logicalrep_rel_close(rel, NoLock);
 
-	CommandCounterIncrement();
+	end_replication_step();
 }
 
 /*
@@ -936,8 +952,9 @@ apply_handle_truncate(StringInfo s)
 	List	   *relids = NIL;
 	List	   *relids_logged = NIL;
 	ListCell   *lc;
+	LOCKMODE	lockmode = AccessExclusiveLock;
 
-	ensure_transaction();
+	begin_replication_step();
 
 	remote_relids = logicalrep_read_truncate(s, &cascade, &restart_seqs);
 
@@ -946,14 +963,14 @@ apply_handle_truncate(StringInfo s)
 		LogicalRepRelId relid = lfirst_oid(lc);
 		LogicalRepRelMapEntry *rel;
 
-		rel = logicalrep_rel_open(relid, RowExclusiveLock);
+		rel = logicalrep_rel_open(relid, lockmode);
 		if (!should_apply_changes_for_rel(rel))
 		{
 			/*
 			 * The relation can't become interesting in the middle of the
 			 * transaction so it's safe to unlock it.
 			 */
-			logicalrep_rel_close(rel, RowExclusiveLock);
+			logicalrep_rel_close(rel, lockmode);
 			continue;
 		}
 
@@ -978,7 +995,7 @@ apply_handle_truncate(StringInfo s)
 		logicalrep_rel_close(rel, NoLock);
 	}
 
-	CommandCounterIncrement();
+	end_replication_step();
 }
 
 
@@ -1158,7 +1175,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 
 		MemoryContextSwitchTo(ApplyMessageContext);
 
-		len = walrcv_receive(wrconn, &buf, &fd);
+		len = walrcv_receive(LogRepWorkerWalRcvConn, &buf, &fd);
 
 		if (len != 0)
 		{
@@ -1238,7 +1255,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 					MemoryContextReset(ApplyMessageContext);
 				}
 
-				len = walrcv_receive(wrconn, &buf, &fd);
+				len = walrcv_receive(LogRepWorkerWalRcvConn, &buf, &fd);
 			}
 		}
 
@@ -1268,7 +1285,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 		{
 			TimeLineID	tli;
 
-			walrcv_endstreaming(wrconn, &tli);
+			walrcv_endstreaming(LogRepWorkerWalRcvConn, &tli);
 			break;
 		}
 
@@ -1431,7 +1448,8 @@ send_feedback(XLogRecPtr recvpos, bool force, bool requestReply)
 		 (uint32) (flushpos >> 32), (uint32) flushpos
 		);
 
-	walrcv_send(wrconn, reply_message->data, reply_message->len);
+	walrcv_send(LogRepWorkerWalRcvConn,
+				reply_message->data, reply_message->len);
 
 	if (recvpos > last_recvpos)
 		last_recvpos = recvpos;
@@ -1743,9 +1761,9 @@ ApplyWorkerMain(Datum main_arg)
 		origin_startpos = replorigin_session_get_progress(false);
 		CommitTransactionCommand();
 
-		wrconn = walrcv_connect(MySubscription->conninfo, true, MySubscription->name,
-								&err);
-		if (wrconn == NULL)
+		LogRepWorkerWalRcvConn = walrcv_connect(MySubscription->conninfo, true,
+												MySubscription->name, &err);
+		if (LogRepWorkerWalRcvConn == NULL)
 			ereport(ERROR,
 					(errmsg("could not connect to the publisher: %s", err)));
 
@@ -1753,8 +1771,7 @@ ApplyWorkerMain(Datum main_arg)
 		 * We don't really use the output identify_system for anything but it
 		 * does some initializations on the upstream so let's still call it.
 		 */
-		(void) walrcv_identify_system(wrconn, &startpointTLI);
-
+		(void) walrcv_identify_system(LogRepWorkerWalRcvConn, &startpointTLI);
 	}
 
 	/*
@@ -1773,7 +1790,7 @@ ApplyWorkerMain(Datum main_arg)
 	options.proto.logical.publication_names = MySubscription->publications;
 
 	/* Start normal logical streaming replication. */
-	walrcv_startstreaming(wrconn, &options);
+	walrcv_startstreaming(LogRepWorkerWalRcvConn, &options);
 
 	/* Run the main loop. */
 	LogicalRepApplyLoop(origin_startpos);

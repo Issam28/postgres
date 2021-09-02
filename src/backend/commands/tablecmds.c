@@ -3521,6 +3521,37 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 }
 
 /*
+ *		ResetRelRewrite - reset relrewrite
+ */
+void
+ResetRelRewrite(Oid myrelid)
+{
+	Relation	relrelation;	/* for RELATION relation */
+	HeapTuple	reltup;
+	Form_pg_class relform;
+
+	/*
+	 * Find relation's pg_class tuple.
+	 */
+	relrelation = table_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(myrelid));
+	if (!HeapTupleIsValid(reltup))	/* shouldn't happen */
+		elog(ERROR, "cache lookup failed for relation %u", myrelid);
+	relform = (Form_pg_class) GETSTRUCT(reltup);
+
+	/*
+	 * Update pg_class tuple.
+	 */
+	relform->relrewrite = InvalidOid;
+
+	CatalogTupleUpdate(relrelation, &reltup->t_self, reltup);
+
+	heap_freetuple(reltup);
+	table_close(relrelation, RowExclusiveLock);
+}
+
+/*
  * Disallow ALTER TABLE (and similar commands) when the current backend has
  * any open reference to the target table besides the one just acquired by
  * the calling command; this implies there's an open cursor or active plan.
@@ -5372,6 +5403,9 @@ ATWrongRelkindError(Relation rel, int allowed_targets)
 		case ATT_TABLE | ATT_MATVIEW | ATT_INDEX:
 			msg = _("\"%s\" is not a table, materialized view, or index");
 			break;
+		case ATT_TABLE | ATT_MATVIEW | ATT_INDEX | ATT_PARTITIONED_INDEX:
+			msg = _("\"%s\" is not a table, materialized view, index, or partitioned index");
+			break;
 		case ATT_TABLE | ATT_MATVIEW | ATT_FOREIGN_TABLE:
 			msg = _("\"%s\" is not a table, materialized view, or foreign table");
 			break;
@@ -5383,6 +5417,9 @@ ATWrongRelkindError(Relation rel, int allowed_targets)
 			break;
 		case ATT_TABLE | ATT_MATVIEW | ATT_INDEX | ATT_FOREIGN_TABLE:
 			msg = _("\"%s\" is not a table, materialized view, index, or foreign table");
+			break;
+		case ATT_TABLE | ATT_PARTITIONED_INDEX:
+			msg = _("\"%s\" is not a table or partitioned index");
 			break;
 		case ATT_VIEW:
 			msg = _("\"%s\" is not a view");
@@ -11313,9 +11350,10 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 	/*
 	 * Here we go --- change the recorded column type and collation.  (Note
 	 * heapTup is a copy of the syscache entry, so okay to scribble on.) First
-	 * fix up the missing value if any.
+	 * fix up the missing value if any. There shouldn't be any missing values
+	 * for anything except plain tables, but if there are, ignore them.
 	 */
-	if (attTup->atthasmissing)
+	if (rel->rd_rel->relkind == RELKIND_RELATION  && attTup->atthasmissing)
 	{
 		Datum		missingval;
 		bool		missingNull;
@@ -16681,10 +16719,10 @@ CloneRowTriggersToPartition(Relation parent, Relation partition)
 		trigStmt->initdeferred = trigForm->tginitdeferred;
 		trigStmt->constrrel = NULL; /* passed separately */
 
-		CreateTrigger(trigStmt, NULL, RelationGetRelid(partition),
-					  trigForm->tgconstrrelid, InvalidOid, InvalidOid,
-					  trigForm->tgfoid, trigForm->oid, qual,
-					  false, true);
+		CreateTriggerFiringOn(trigStmt, NULL, RelationGetRelid(partition),
+							  trigForm->tgconstrrelid, InvalidOid, InvalidOid,
+							  trigForm->tgfoid, trigForm->oid, qual,
+							  false, true, trigForm->tgenabled);
 
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextReset(perTupCxt);

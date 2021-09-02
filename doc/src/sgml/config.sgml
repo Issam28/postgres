@@ -1732,6 +1732,11 @@ include_dir 'conf.d'
         too high.  It may be useful to control for this by separately
         setting <xref linkend="guc-autovacuum-work-mem"/>.
        </para>
+       <para>
+        Note that for the collection of dead tuple identifiers,
+        <command>VACUUM</command> is only able to utilize up to a maximum of
+        <literal>1GB</literal> of memory.
+       </para>
       </listitem>
      </varlistentry>
 
@@ -1753,6 +1758,13 @@ include_dir 'conf.d'
         This parameter can only be set in the
         <filename>postgresql.conf</filename> file or on the server command
         line.
+       </para>
+       <para>
+        For the collection of dead tuple identifiers, autovacuum is only able
+        to utilize up to a maximum of <literal>1GB</literal> of memory, so
+        setting <varname>autovacuum_work_mem</varname> to a value higher than
+        that has no effect on the number of dead tuples that autovacuum can
+        collect while scanning a table.
        </para>
       </listitem>
      </varlistentry>
@@ -7767,6 +7779,66 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
 
        <para>
         Consult <xref linkend="sql-set-transaction"/> for more information.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-transaction-isolation" xreflabel="transaction_isolation">
+      <term><varname>transaction_isolation</varname> (<type>enum</type>)
+      <indexterm>
+       <primary>transaction isolation level</primary>
+      </indexterm>
+      <indexterm>
+       <primary><varname>transaction_isolation</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        This parameter reflects the current transaction's isolation level.
+        At the beginning of each transaction, it is set to the current value
+        of <xref linkend="guc-default-transaction-isolation"/>.
+        Any subsequent attempt to change it is equivalent to a <xref
+        linkend="sql-set-transaction"/> command.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-transaction-read-only" xreflabel="transaction_read_only">
+      <term><varname>transaction_read_only</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary>read-only transaction</primary>
+      </indexterm>
+      <indexterm>
+       <primary><varname>transaction_read_only</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        This parameter reflects the current transaction's read-only status.
+        At the beginning of each transaction, it is set to the current value
+        of <xref linkend="guc-default-transaction-read-only"/>.
+        Any subsequent attempt to change it is equivalent to a <xref
+        linkend="sql-set-transaction"/> command.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-transaction-deferrable" xreflabel="transaction_deferrable">
+      <term><varname>transaction_deferrable</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary>deferrable transaction</primary>
+      </indexterm>
+      <indexterm>
+       <primary><varname>transaction_deferrable</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        This parameter reflects the current transaction's deferrability status.
+        At the beginning of each transaction, it is set to the current value
+        of <xref linkend="guc-default-transaction-deferrable"/>.
+        Any subsequent attempt to change it is equivalent to a <xref
+        linkend="sql-set-transaction"/> command.
        </para>
       </listitem>
      </varlistentry>
